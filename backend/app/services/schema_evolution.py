@@ -70,8 +70,16 @@ class SchemaEvolutionService(BaseModuleService):
 
         return entry, f"Schema 变更 {entry.get('湖表名')} - {change_type} 已提交审批，兼容级别={compat_level}"
 
-    def execute_change(self, entry_id: int) -> tuple[dict[str, Any] | None, str]:
-        """执行 Schema 变更：联动回填任务进行存量数据迁移。"""
+    def execute_change(
+        self,
+        entry_id: int,
+        columns: list[Any] | None = None,
+    ) -> tuple[dict[str, Any] | None, str]:
+        """执行 Schema 变更：联动回填任务进行存量数据迁移。
+
+        不兼容变更会把确认后的字段定义（列名和类型）随变更事件传给回填，
+        回填侧登记为回填字段版本记录，中断恢复时据此核对下一段结构。
+        """
         entry = store.find(self.MODULE, entry_id)
         if entry is None:
             return None, "Schema 变更不存在"
@@ -95,13 +103,29 @@ class SchemaEvolutionService(BaseModuleService):
                     if bj.get("status") == "待调度":
                         bj["pending"] = True
 
-            store.log_event("schema_to_backfill", "schema_evolution", "backfill_job", {
+            # 变更后的列定义：以执行时确认的定义为准，缺省按变更字段生成
+            change_columns = columns or [
+                {"name": entry.get("变更字段", ""), "type": "待确认"}
+            ]
+
+            event = store.log_event("schema_to_backfill", "schema_evolution", "backfill_job", {
                 "entry_id": entry_id,
                 "table_name": table_name,
                 "change_type": change_type,
                 "compat_level": compat_level,
+                "columns": change_columns,
                 "affected_jobs": len(backfill_jobs),
             })
+
+            # 字段变更事件同步登记为回填字段版本记录，恢复时可从确认记录追查
+            from app.services.backfill_job import BackfillJobService
+            BackfillJobService().apply_schema_change(
+                table_name,
+                change_columns,
+                source=f"schema_event#{event['id']}",
+                confirmed_by=f"schema_evolution#{entry_id}",
+                event_id=event["id"],
+            )
 
         store.log_event("schema_executed", "schema_evolution", "lake_table", {
             "entry_id": entry_id,

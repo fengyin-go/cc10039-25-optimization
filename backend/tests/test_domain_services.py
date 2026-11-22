@@ -311,6 +311,205 @@ class TestBackfillJob:
         pytest.skip("No backfill in 待调度")
 
 
+class TestBackfillFieldVersion:
+    """回填字段版本记录：Schema 变更中断恢复的端到端场景。
+
+    场景：按整数列定义先写完半个区间 → 暂停回填 → Schema 演进生效文本列
+    → 恢复运行核对下一段输入范围 → 续写后半区间 → 分段详情对照直到任务关闭。
+    """
+
+    def setup_method(self):
+        self.svc = BackfillJobService()
+        self.schema_svc = SchemaEvolutionService()
+
+    def _create_task(self, table: str) -> dict:
+        entry, missing = self.svc.create_entry({
+            "任务名称": f"回填-{table}",
+            "目标湖表": table,
+            "回填时间范围": "2026-01-01~2026-06-30",
+            "处理记录数": "0",
+            "执行状态": "未启动",
+        })
+        assert entry is not None, f"缺少必填字段: {missing}"
+        return entry
+
+    def _execute_schema_change(self, table: str, columns: list) -> dict:
+        """发布并执行一个不兼容 Schema 变更，返回变更记录。"""
+        se, missing = self.schema_svc.create_entry({
+            "湖表名": table,
+            "变更类型": "修改字段类型",
+            "变更字段": columns[0]["name"],
+            "兼容级别": "不兼容",
+            "变更前快照": "",
+        })
+        assert se is not None, f"缺少必填字段: {missing}"
+        approved, msg = self.schema_svc.submit_approval(se["id"])
+        assert approved is not None, msg
+        executed, msg = self.schema_svc.execute_change(se["id"], columns=columns)
+        assert executed is not None, msg
+        return se
+
+    def test_segment_write_pause_schema_change_resume(self):
+        """整数列写半区间 → 暂停 → 文本列生效 → 恢复核对 → 续写 → 关闭。"""
+        table = "orders_fact_version_e2e"
+        task = self._create_task(table)
+        tid = task["id"]
+
+        # 启动并登记初始字段版本：整数列
+        entry, msg = self.svc.start_backfill(tid)
+        assert entry is not None, msg
+        v1, msg = self.svc.register_field_version(
+            tid, [{"name": "amount", "type": "整数"}], source="初始定义")
+        assert v1 is not None and v1["version"] == 1
+
+        # 按整数列定义先写完半个区间 [0, 500)
+        seg1, msg = self.svc.write_segment(tid, 500)
+        assert seg1 is not None, msg
+        assert (seg1["range_start"], seg1["range_end"]) == (0, 500)
+        assert seg1["columns"] == [{"name": "amount", "type": "整数"}]
+        assert seg1["version"] == 1
+
+        # 暂停回填（中断），已提交分段保留
+        paused, msg = self.svc.pause_backfill(tid)
+        assert paused is not None and paused["status"] == "已暂停"
+
+        # 暂停期间 Schema 演进发布文本列定义（不兼容变更）
+        se = self._execute_schema_change(table, [{"name": "amount", "type": "文本"}])
+
+        # 回填字段版本记录已同步：v2 文本列，可从确认记录追查
+        current = self.svc.current_field_version(tid)
+        assert current is not None and current["version"] == 2
+        assert current["columns"] == [{"name": "amount", "type": "文本"}]
+        assert current["confirmed_by"] == f"schema_evolution#{se['id']}"
+
+        # 恢复运行：核对已写列的重读方式、下一段结构和输入范围
+        review, msg = self.svc.resume_backfill(tid)
+        assert review is not None, msg
+        assert review["processed_range"] == {"start": 0, "end": 500}
+        assert review["committed_rows"] == 500
+        assert review["next_range_start"] == 500
+        assert review["last_segment_columns"] == [{"name": "amount", "type": "整数"}]
+        assert review["next_columns"] == [{"name": "amount", "type": "文本"}]
+        assert review["version_source"] == f"schema_evolution#{se['id']}"
+
+        # 续写后半区间 [500, 1000)，按文本列定义落库
+        seg2, msg = self.svc.write_segment(tid, 500)
+        assert seg2 is not None, msg
+        assert (seg2["range_start"], seg2["range_end"]) == (500, 1000)
+        assert seg2["columns"] == [{"name": "amount", "type": "文本"}]
+        assert seg2["version"] == 2
+
+        # 分段详情：对照各段使用的字段定义及行数
+        detail, msg = self.svc.segment_detail(tid)
+        assert detail is not None
+        assert detail["committed_rows"] == 1000
+        assert detail["processed_range"] == {"start": 0, "end": 1000}
+        assert detail["consistent"] is True
+        assert [s["version"] for s in detail["segments"]] == [1, 2]
+        assert [s["row_count"] for s in detail["segments"]] == [500, 500]
+        assert detail["segments"][0]["columns"][0]["type"] == "整数"
+        assert detail["segments"][1]["columns"][0]["type"] == "文本"
+        assert [v["version"] for v in detail["field_versions"]] == [1, 2]
+
+        # 任务关闭：已提交范围不重算，分段详情仍可对照
+        done, msg = self.svc.complete_backfill(tid, 1000)
+        assert done is not None and done["status"] == "已完成"
+        assert done["处理记录数"] == "1000"
+        closed, _ = self.svc.segment_detail(tid)
+        assert closed["committed_rows"] == 1000
+        assert len(closed["segments"]) == 2
+        assert len(closed["field_versions"]) == 2
+
+    def test_committed_segments_not_recounted_on_resume(self):
+        """已提交的数据不会在续做时再算一次。"""
+        task = self._create_task("orders_fact_no_recount")
+        tid = task["id"]
+        self.svc.start_backfill(tid)
+        self.svc.register_field_version(
+            tid, [{"name": "amount", "type": "整数"}], source="初始定义")
+        self.svc.write_segment(tid, 300)
+        self.svc.pause_backfill(tid)
+
+        review, _ = self.svc.resume_backfill(tid)
+        assert review["processed_range"]["end"] == 300
+        assert review["committed_rows"] == 300
+        assert review["next_range_start"] == 300
+
+        entry = store.find("backfill_job", tid)
+        assert entry["处理记录数"] == "300"
+
+        # 同一范围重复提交被幂等拒绝，不重复计数
+        self.svc._checkpoints[tid] = 0  # 模拟脏检查点
+        self.svc.pause_backfill(tid)
+        review2, _ = self.svc.resume_backfill(tid)
+        # 恢复时核对并修正：以已提交范围末尾为准
+        assert review2["next_range_start"] == 300
+        assert self.svc.get_checkpoint(tid) == 300
+
+    def test_write_segment_requires_running_and_version(self):
+        """状态与字段版本守卫：未启动、未登记版本都不可落库。"""
+        task = self._create_task("orders_fact_guard")
+        tid = task["id"]
+
+        seg, msg = self.svc.write_segment(tid, 100)
+        assert seg is None and "不可写入分段" in msg
+
+        self.svc.start_backfill(tid)
+        seg2, msg2 = self.svc.write_segment(tid, 100)
+        assert seg2 is None and "字段版本" in msg2
+
+        # 暂停后也不可写入
+        self.svc.register_field_version(
+            tid, [{"name": "c1", "type": "整数"}], source="初始定义")
+        self.svc.pause_backfill(tid)
+        seg3, msg3 = self.svc.write_segment(tid, 100)
+        assert seg3 is None and "不可写入分段" in msg3
+
+    def test_sync_schema_events_idempotent(self):
+        """从 Schema 变更事件同步字段版本记录：同一事件不重复登记。"""
+        table = "orders_fact_sync"
+        task = self._create_task(table)
+        tid = task["id"]
+
+        # 执行不兼容变更：推送登记一次
+        se = self._execute_schema_change(table, [{"name": "c1", "type": "文本"}])
+        assert len(self.svc._field_versions[tid]) == 1
+
+        # 再同步事件日志：已消费，不重复登记
+        assert self.svc.sync_schema_events(tid) == []
+        assert len(self.svc._field_versions[tid]) == 1
+
+        # 兜底路径：事件先于任务存在时从日志补登记
+        store.log_event("schema_to_backfill", "schema_evolution", "backfill_job", {
+            "entry_id": se["id"],
+            "table_name": table,
+            "change_type": "修改字段类型",
+            "compat_level": "不兼容",
+            "columns": [{"name": "c1", "type": "整数"}],
+        })
+        versions = self.svc.sync_schema_events(tid)
+        assert len(versions) == 1
+        assert versions[0]["columns"] == [{"name": "c1", "type": "整数"}]
+        assert self.svc.sync_schema_events(tid) == []
+
+    def test_closed_task_not_versioned(self):
+        """已关闭任务不再接收新的字段版本。"""
+        table = "orders_fact_closed"
+        task = self._create_task(table)
+        tid = task["id"]
+        self.svc.start_backfill(tid)
+        self.svc.register_field_version(
+            tid, [{"name": "c1", "type": "整数"}], source="初始定义")
+        self.svc.write_segment(tid, 100)
+        self.svc.complete_backfill(tid, 100)
+
+        affected = self.svc.apply_schema_change(
+            table, [{"name": "c1", "type": "文本"}],
+            source="schema_event#x", confirmed_by="schema_evolution#x")
+        assert affected == []
+        assert len(self.svc._field_versions[tid]) == 1
+
+
 class TestIngestPipeline:
     """入湖管道 + 质量监控联动"""
 
